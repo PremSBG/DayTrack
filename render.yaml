@@ -1,5 +1,5 @@
 services:
-  - type: worker
+  - type: web
     name: daytrack-bot
     runtime: python
     buildCommand: pip install -r requirements.txt
@@ -13,3 +13,5 @@ services:
         sync: false
       - key: TURSO_AUTH_TOKEN
         sync: false
+      - key: PORT
+        value: "8080"
