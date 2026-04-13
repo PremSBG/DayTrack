@@ -13,5 +13,5 @@ python-dotenv==1.0.0
 # Timezone support
 pytz==2024.1
 
-# Turso / libSQL (cloud database — optional, for production)
-libsql-experimental==0.0.55
+# Turso / libSQL (cloud database via HTTP API)
+requests==2.31.0
