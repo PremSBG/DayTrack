@@ -20,7 +20,12 @@ def morning_greeting(name: str) -> str:
 
 
 def morning_plan_prompt() -> str:
-    return "\nWhat's your plan for today? Just tell me in your own words — a paragraph, a list, whatever feels natural. 📝"
+    return (
+        "\nWhat's your plan for today? 📝\n\n"
+        "Just type your tasks — a paragraph, a list, anything works. For example:\n"
+        "\"Gym in the morning, finish the report, call mom, read 20 pages\"\n\n"
+        "Go ahead, I'll organize them for you! 👇"
+    )
 
 
 def morning_tasks_confirmation(formatted_tasks: str) -> str:

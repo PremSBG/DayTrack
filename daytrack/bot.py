@@ -104,7 +104,7 @@ async def ob_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
 
     # Handle reminders
-    if text.lower() in ("keep", "skip", "default", "defaults"):
+    if text.lower() in ("keep", "skip", "default", "defaults", "yes", "ok", "sure"):
         db.set_default_reminders(user_id)
     else:
         # Parse comma or newline separated custom reminders
@@ -112,7 +112,7 @@ async def ob_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if items:
             for item in items[:10]:
                 db.add_reminder(user_id, "morning", item)
-            db.set_default_reminders_evening_only(user_id) if hasattr(db, 'set_default_reminders_evening_only') else db.set_default_reminders(user_id)
+            db.set_default_reminders(user_id)
         else:
             db.set_default_reminders(user_id)
 
@@ -132,6 +132,45 @@ async def ob_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
 async def ob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Cancel onboarding."""
     await update.message.reply_text("No worries! Send /start whenever you're ready. 👋")
+    return ConversationHandler.END
+
+
+async def ob_command_during_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle any command sent during onboarding — auto-complete with defaults."""
+    user_id = update.effective_user.id
+    ud = context.user_data
+
+    # If user already exists (shouldn't happen but safety check)
+    if db.get_user(user_id):
+        await update.message.reply_text("You're already set up! Try /help to see what I can do. 😊")
+        return ConversationHandler.END
+
+    # If we have a name, save user with defaults
+    name = ud.get("name", update.effective_user.first_name or "Friend")
+
+    db.create_user(
+        user_id=user_id,
+        username=update.effective_user.username or "",
+        first_name=name,
+        timezone=DEFAULT_TIMEZONE,
+        morning_time=DEFAULT_MORNING_TIME,
+        evening_time=DEFAULT_EVENING_TIME,
+    )
+    db.set_default_reminders(user_id)
+
+    user = db.get_user(user_id)
+    schedule_user_flows(
+        user_id, user["morning_time"], user["evening_time"], user["timezone"],
+        trigger_morning_flow, trigger_evening_flow,
+    )
+
+    await update.message.reply_text(
+        f"I've set you up with defaults, {name}! 🎉\n\n"
+        f"  ☀️ Morning: 7:00 AM\n"
+        f"  🌙 Evening: 11:00 PM\n"
+        f"  📝 Default reminders set\n\n"
+        f"You can customize everything with /settings. Now try the command you wanted! 😊"
+    )
     return ConversationHandler.END
 
 
@@ -745,7 +784,10 @@ def create_app(token: str, database: DatabaseManager, ai_client: GroqAIClient) -
             OB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_name)],
             OB_REMINDERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_reminders)],
         },
-        fallbacks=[CommandHandler("cancel", ob_cancel)],
+        fallbacks=[
+            CommandHandler("cancel", ob_cancel),
+            MessageHandler(filters.COMMAND, ob_command_during_setup),
+        ],
         name="onboarding",
     )
 

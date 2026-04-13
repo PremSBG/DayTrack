@@ -25,7 +25,7 @@ class ContentSafetyError(Exception):
 class GroqAIClient:
     """Handles all Groq API interactions with structured prompts."""
 
-    def __init__(self, api_key: str, model: str = "llama-3.1-70b-versatile",
+    def __init__(self, api_key: str, model: str = "llama-3.3-70b-versatile",
                  max_tokens: int = 1024, temperature: float = 0.7):
         self.client = Groq(api_key=api_key)
         self.model = model

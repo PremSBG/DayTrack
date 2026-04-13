@@ -1,8 +1,8 @@
 # Telegram Bot Framework
-python-telegram-bot[job-queue]==20.7
+python-telegram-bot[job-queue]==21.10
 
 # Groq AI Integration
-groq==0.4.2
+groq==1.1.2
 
 # Scheduling
 APScheduler==3.10.4
