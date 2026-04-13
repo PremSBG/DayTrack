@@ -1,0 +1,17 @@
+# Telegram Bot Framework
+python-telegram-bot[job-queue]==20.7
+
+# Groq AI Integration
+groq==0.4.2
+
+# Scheduling
+APScheduler==3.10.4
+
+# Environment Variables
+python-dotenv==1.0.0
+
+# Timezone support
+pytz==2024.1
+
+# Turso / libSQL (cloud database — optional, for production)
+libsql-experimental==0.0.55
