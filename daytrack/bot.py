@@ -23,7 +23,7 @@ from telegram.ext import (
 from daytrack.ai_client import ContentSafetyError, GroqAIClient
 from daytrack.database import DatabaseManager
 from daytrack.messages import (
-    ask_custom_reminders, ask_morning_time, ask_evening_time, ask_timezone,
+    ask_custom_reminders, ask_morning_time, ask_evening_time,
     evening_greeting, evening_memory_prompt, evening_memory_saved,
     evening_no_plan, evening_review_prompt, evening_score,
     fallback, goodnight, help_text, memory_recall, morning_greeting,
@@ -51,7 +51,7 @@ ai: GroqAIClient = None  # type: ignore
 # ── Conversation states ──────────────────────────────────────────────
 
 # Onboarding
-OB_NAME, OB_TIMEZONE, OB_REMINDERS = range(3)
+OB_NAME, OB_REMINDERS = range(2)
 
 # Morning flow
 MF_PLAN, MF_CONFIRM = range(10, 12)
@@ -79,23 +79,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
 
 
 async def ob_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Store name, ask timezone."""
+    """Store name, ask about custom reminders."""
     context.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text(f"Nice to meet you, {context.user_data['name']}! 😊\n\n{ask_timezone()}")
-    return OB_TIMEZONE
-
-
-async def ob_timezone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Validate timezone, ask about custom reminders."""
-    text = update.message.text.strip()
-    if text.lower() == "skip":
-        context.user_data["timezone"] = DEFAULT_TIMEZONE
-    elif validate_timezone(text):
-        context.user_data["timezone"] = text
-    else:
-        await update.message.reply_text(f"Hmm, '{text}' doesn't look like a valid timezone. Try again? (e.g., Asia/Kolkata)")
-        return OB_TIMEZONE
-    await update.message.reply_text(ask_custom_reminders())
+    await update.message.reply_text(
+        f"Nice to meet you, {context.user_data['name']}! 😊\n\n{ask_custom_reminders()}"
+    )
     return OB_REMINDERS
 
 
@@ -110,7 +98,7 @@ async def ob_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         user_id=user_id,
         username=update.effective_user.username or "",
         first_name=ud["name"],
-        timezone=ud.get("timezone", DEFAULT_TIMEZONE),
+        timezone=DEFAULT_TIMEZONE,
         morning_time=DEFAULT_MORNING_TIME,
         evening_time=DEFAULT_EVENING_TIME,
     )
@@ -136,7 +124,7 @@ async def ob_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     )
 
     await update.message.reply_text(
-        onboarding_complete(user["first_name"], user["timezone"])
+        onboarding_complete(user["first_name"])
     )
     return ConversationHandler.END
 
@@ -637,6 +625,47 @@ async def st_reminder_remove(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 # ══════════════════════════════════════════════════════════════════════
+# MORNING / EVENING COMMAND ENTRY POINTS
+# ══════════════════════════════════════════════════════════════════════
+
+async def morning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /morning — start morning planning flow."""
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please run /start first! 😊")
+        return ConversationHandler.END
+    reminders = get_flow_reminders(db, user["user_id"], "morning")
+    text = (
+        f"{morning_greeting(user['first_name'])}\n\n"
+        f"Your morning reminders:\n{format_reminders(reminders)}\n"
+        f"{morning_plan_prompt()}"
+    )
+    await update.message.reply_text(text)
+    date = today_str(user["timezone"])
+    if not db.get_daily_plan(user["user_id"], date):
+        db.create_daily_plan(user["user_id"], date)
+    return MF_PLAN
+
+
+async def evening_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle /evening — start evening review flow."""
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please run /start first! 😊")
+        return ConversationHandler.END
+    date = today_str(user["timezone"])
+    plan = db.get_daily_plan(user["user_id"], date)
+    if plan and plan.get("morning_completed_at"):
+        tasks = db.get_tasks_for_plan(plan["id"])
+        formatted = format_tasks_by_category([dict(t) for t in tasks])
+        text = f"{evening_greeting(user['first_name'])}\n\n{evening_review_prompt(formatted)}"
+    else:
+        text = f"{evening_greeting(user['first_name'])}\n\n{evening_no_plan()}"
+    await update.message.reply_text(text)
+    return EF_UPDATE
+
+
+# ══════════════════════════════════════════════════════════════════════
 # STANDALONE COMMANDS
 # ══════════════════════════════════════════════════════════════════════
 
@@ -709,21 +738,20 @@ def create_app(token: str, database: DatabaseManager, ai_client: GroqAIClient) -
     app = Application.builder().token(token).build()
     _app = app
 
-    # Onboarding conversation (simplified — fixed times)
+    # Onboarding conversation (simplified — just name + reminders)
     onboarding_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
         states={
             OB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_name)],
-            OB_TIMEZONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_timezone)],
             OB_REMINDERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_reminders)],
         },
         fallbacks=[CommandHandler("cancel", ob_cancel)],
         name="onboarding",
     )
 
-    # Morning flow conversation
+    # Morning flow conversation (entry via /morning command or scheduler)
     morning_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, mf_plan)],
+        entry_points=[CommandHandler("morning", morning_command)],
         states={
             MF_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, mf_plan)],
             MF_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, mf_confirm)],
@@ -732,9 +760,9 @@ def create_app(token: str, database: DatabaseManager, ai_client: GroqAIClient) -
         name="morning_flow",
     )
 
-    # Evening flow conversation
+    # Evening flow conversation (entry via /evening command or scheduler)
     evening_handler = ConversationHandler(
-        entry_points=[MessageHandler(filters.TEXT & ~filters.COMMAND, ef_update)],
+        entry_points=[CommandHandler("evening", evening_command)],
         states={
             EF_UPDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ef_update)],
             EF_MEMORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ef_memory)],
@@ -759,6 +787,8 @@ def create_app(token: str, database: DatabaseManager, ai_client: GroqAIClient) -
 
     # Register handlers (order matters)
     app.add_handler(onboarding_handler)
+    app.add_handler(morning_handler)
+    app.add_handler(evening_handler)
     app.add_handler(settings_handler)
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("memories", memories_command))

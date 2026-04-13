@@ -133,12 +133,11 @@ def ask_custom_reminders() -> str:
     )
 
 
-def onboarding_complete(name: str, tz: str) -> str:
+def onboarding_complete(name: str) -> str:
     return (
-        f"All set, {name}! 🎉 Here's your setup:\n\n"
-        f"  🌍 Timezone: {tz}\n"
-        f"  ☀️ Morning: 07:00 AM\n"
-        f"  🌙 Evening: 11:00 PM\n\n"
+        f"All set, {name}! 🎉\n\n"
+        f"  ☀️ Morning check-in: 7:00 AM\n"
+        f"  🌙 Evening check-in: 11:00 PM\n\n"
         "I'll see you at your next scheduled time. Have a great one! 🚀"
     )
 
@@ -162,11 +161,13 @@ def help_text() -> str:
     return (
         "Here's what I can do:\n\n"
         "  /start — Set up your profile\n"
+        "  /morning — Start your morning planning\n"
+        "  /evening — Start your evening review\n"
         "  /today — See today's plan and status\n"
         "  /settings — Update your preferences\n"
         "  /memories — Revisit a random past memory\n"
         "  /help — Show this message\n\n"
-        "Or just chat with me during our morning and evening check-ins! 💬"
+        "I'll also check in with you automatically at 7 AM and 11 PM! 💬"
     )
 
 
