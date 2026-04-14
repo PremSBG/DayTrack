@@ -15,3 +15,6 @@ pytz==2024.1
 
 # Turso / libSQL (cloud database via HTTP API)
 requests==2.31.0
+
+# Health server for Render
+aiohttp==3.9.3

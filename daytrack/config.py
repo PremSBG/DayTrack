@@ -37,6 +37,8 @@ class Config:
         required = {
             "TELEGRAM_BOT_TOKEN": cls.TELEGRAM_BOT_TOKEN,
             "GROQ_API_KEY": cls.GROQ_API_KEY,
+            "TURSO_DATABASE_URL": cls.TURSO_DATABASE_URL,
+            "TURSO_AUTH_TOKEN": cls.TURSO_AUTH_TOKEN,
         }
         missing = [k for k, v in required.items() if not v]
         if missing:

@@ -1,7 +1,5 @@
 """
-Bot Module
-==========
-Telegram bot handlers, conversation flows, and command routing for DayTrack.
+Bot Module — Telegram handlers with button-based UI for DayTrack.
 """
 
 import json
@@ -11,30 +9,14 @@ from datetime import datetime, timedelta
 import pytz
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ConversationHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
+    Application, CallbackQueryHandler, CommandHandler, ConversationHandler,
+    ContextTypes, MessageHandler, filters,
 )
 
 from daytrack.ai_client import ContentSafetyError, GroqAIClient
 from daytrack.database import DatabaseManager
-from daytrack.messages import (
-    ask_custom_reminders, ask_morning_time, ask_evening_time,
-    evening_greeting, evening_memory_prompt, evening_memory_saved,
-    evening_no_plan, evening_review_prompt, evening_score,
-    fallback, goodnight, help_text, memory_recall, morning_greeting,
-    morning_plan_prompt, morning_tasks_confirmation, morning_tasks_saved,
-    no_memories, onboarding_complete, settings_menu, voice_not_supported,
-    weekly_no_tasks, weekly_summary_header, welcome_back, welcome_new,
-)
-from daytrack.scheduler import (
-    init_scheduler, reschedule_user_flows, restore_all_schedules,
-    schedule_user_flows, scheduler,
-)
+from daytrack.messages import *
+from daytrack.scheduler import reschedule_user_flows, schedule_user_flows
 from daytrack.utils import (
     DEFAULT_EVENING_TIME, DEFAULT_MORNING_TIME, DEFAULT_TIMEZONE,
     calculate_day_score, check_content, format_reminders,
@@ -44,265 +26,302 @@ from daytrack.utils import (
 
 logger = logging.getLogger(__name__)
 
-# Global instances — set during startup
 db: DatabaseManager = None  # type: ignore
 ai: GroqAIClient = None  # type: ignore
 
-# ── Conversation states ──────────────────────────────────────────────
+# Conversation states
+OB_NAME = 0
+MF_PLAN, MF_CONFIRM = 10, 11
+EF_UPDATE, EF_MEMORY = 20, 21
+ST_CHOOSE, ST_VALUE = 30, 31
+ST_REM_ACTION, ST_REM_ADD, ST_REM_REMOVE = 33, 34, 35
 
-# Onboarding
-OB_NAME, OB_REMINDERS = range(2)
 
-# Morning flow
-MF_PLAN, MF_CONFIRM = range(10, 12)
+# ── Shared UI ────────────────────────────────────────────────────────
 
-# Evening flow
-EF_UPDATE, EF_MEMORY = range(20, 22)
+def main_menu_keyboard():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("☀️ Morning", callback_data="menu_morning"),
+         InlineKeyboardButton("🌙 Evening", callback_data="menu_evening")],
+        [InlineKeyboardButton("📋 Today", callback_data="menu_today"),
+         InlineKeyboardButton("⚙️ Settings", callback_data="menu_settings")],
+        [InlineKeyboardButton("💭 Memories", callback_data="menu_memories"),
+         InlineKeyboardButton("❓ Help", callback_data="menu_help")],
+    ])
 
-# Settings
-ST_CHOOSE, ST_VALUE = range(30, 32)
-ST_REMINDER_ACTION, ST_REMINDER_ADD, ST_REMINDER_REMOVE = range(33, 36)
+
+def back_menu_keyboard():
+    return InlineKeyboardMarkup([[InlineKeyboardButton("🏠 Main Menu", callback_data="menu_main")]])
+
+
+async def cancel_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel any conversation and show main menu."""
+    user = db.get_user(update.effective_user.id)
+    if user:
+        await update.message.reply_text("Cancelled! 👍", reply_markup=main_menu_keyboard())
+    else:
+        await update.message.reply_text("Cancelled! Send /start to begin.")
+    return ConversationHandler.END
 
 
 # ══════════════════════════════════════════════════════════════════════
-# ONBOARDING FLOW
+# ONBOARDING
 # ══════════════════════════════════════════════════════════════════════
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /start — begin onboarding or welcome back."""
     user = db.get_user(update.effective_user.id)
     if user:
-        await update.message.reply_text(welcome_back(user["first_name"]))
+        await update.message.reply_text(welcome_back(user["first_name"]), reply_markup=main_menu_keyboard())
         return ConversationHandler.END
     await update.message.reply_text(welcome_new())
     return OB_NAME
 
 
 async def ob_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Store name, ask about custom reminders."""
-    context.user_data["name"] = update.message.text.strip()
-    await update.message.reply_text(
-        f"Nice to meet you, {context.user_data['name']}! 😊\n\n{ask_custom_reminders()}"
-    )
-    return OB_REMINDERS
-
-
-async def ob_reminders(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle custom reminders or defaults, complete onboarding."""
-    text = update.message.text.strip()
+    name = update.message.text.strip()
     user_id = update.effective_user.id
-    ud = context.user_data
 
-    # Create user with fixed times
-    db.create_user(
-        user_id=user_id,
-        username=update.effective_user.username or "",
-        first_name=ud["name"],
-        timezone=DEFAULT_TIMEZONE,
-        morning_time=DEFAULT_MORNING_TIME,
-        evening_time=DEFAULT_EVENING_TIME,
-    )
+    is_clean, warning = check_content(name)
+    if not is_clean:
+        await update.message.reply_text(warning)
+        return OB_NAME
 
-    # Handle reminders
-    if text.lower() in ("keep", "skip", "default", "defaults", "yes", "ok", "sure"):
-        db.set_default_reminders(user_id)
-    else:
-        # Parse comma or newline separated custom reminders
-        items = [r.strip() for r in text.replace("\n", ",").split(",") if r.strip()]
-        if items:
-            for item in items[:10]:
-                db.add_reminder(user_id, "morning", item)
-            db.set_default_reminders(user_id)
-        else:
-            db.set_default_reminders(user_id)
-
-    # Schedule flows
-    user = db.get_user(user_id)
-    schedule_user_flows(
-        user_id, user["morning_time"], user["evening_time"], user["timezone"],
-        trigger_morning_flow, trigger_evening_flow,
-    )
-
-    await update.message.reply_text(
-        onboarding_complete(user["first_name"])
-    )
-    return ConversationHandler.END
-
-
-async def ob_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel onboarding."""
-    await update.message.reply_text("No worries! Send /start whenever you're ready. 👋")
-    return ConversationHandler.END
-
-
-async def ob_command_during_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle any command sent during onboarding — auto-complete with defaults."""
-    user_id = update.effective_user.id
-    ud = context.user_data
-
-    # If user already exists (shouldn't happen but safety check)
-    if db.get_user(user_id):
-        await update.message.reply_text("You're already set up! Try /help to see what I can do. 😊")
-        return ConversationHandler.END
-
-    # If we have a name, save user with defaults
-    name = ud.get("name", update.effective_user.first_name or "Friend")
-
-    db.create_user(
-        user_id=user_id,
-        username=update.effective_user.username or "",
-        first_name=name,
-        timezone=DEFAULT_TIMEZONE,
-        morning_time=DEFAULT_MORNING_TIME,
-        evening_time=DEFAULT_EVENING_TIME,
-    )
+    db.create_user(user_id, update.effective_user.username or "", name,
+                   DEFAULT_TIMEZONE, DEFAULT_MORNING_TIME, DEFAULT_EVENING_TIME)
     db.set_default_reminders(user_id)
 
     user = db.get_user(user_id)
-    schedule_user_flows(
-        user_id, user["morning_time"], user["evening_time"], user["timezone"],
-        trigger_morning_flow, trigger_evening_flow,
-    )
+    schedule_user_flows(user_id, user["morning_time"], user["evening_time"],
+                        user["timezone"], trigger_morning_flow, trigger_evening_flow)
 
-    await update.message.reply_text(
-        f"I've set you up with defaults, {name}! 🎉\n\n"
-        f"  ☀️ Morning: 7:00 AM\n"
-        f"  🌙 Evening: 11:00 PM\n"
-        f"  📝 Default reminders set\n\n"
-        f"You can customize everything with /settings. Now try the command you wanted! 😊"
-    )
+    await update.message.reply_text(onboarding_complete(name), reply_markup=main_menu_keyboard())
     return ConversationHandler.END
+
+
+async def ob_command_fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """If user sends a command during onboarding, auto-complete with defaults."""
+    user_id = update.effective_user.id
+    if db.get_user(user_id):
+        await update.message.reply_text("You're set up! 😊", reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+
+    name = update.effective_user.first_name or "Friend"
+    db.create_user(user_id, update.effective_user.username or "", name,
+                   DEFAULT_TIMEZONE, DEFAULT_MORNING_TIME, DEFAULT_EVENING_TIME)
+    db.set_default_reminders(user_id)
+    user = db.get_user(user_id)
+    schedule_user_flows(user_id, user["morning_time"], user["evening_time"],
+                        user["timezone"], trigger_morning_flow, trigger_evening_flow)
+    await update.message.reply_text(
+        f"Set you up as {name} with defaults! 🎉\nCustomize with ⚙️ Settings.",
+        reply_markup=main_menu_keyboard())
+    return ConversationHandler.END
+
+
+# ══════════════════════════════════════════════════════════════════════
+# MAIN MENU CALLBACK
+# ══════════════════════════════════════════════════════════════════════
+
+async def menu_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+
+    if not user:
+        await query.edit_message_text("Please tap /start first! 😊")
+        return
+
+    if data == "menu_main":
+        await query.edit_message_text(welcome_back(user["first_name"]), reply_markup=main_menu_keyboard())
+    elif data == "menu_morning":
+        await handle_morning_entry(query, user)
+    elif data == "menu_evening":
+        await handle_evening_entry(query, user)
+    elif data == "menu_today":
+        await handle_today(query, user)
+    elif data == "menu_settings":
+        await handle_settings_display(query, user)
+    elif data == "menu_memories":
+        await handle_memories(query, user_id)
+    elif data == "menu_help":
+        await query.edit_message_text(help_text(), reply_markup=back_menu_keyboard())
 
 
 # ══════════════════════════════════════════════════════════════════════
 # MORNING FLOW
 # ══════════════════════════════════════════════════════════════════════
 
-async def trigger_morning_flow(user_id: int) -> None:
-    """Scheduler callback — send morning greeting to user."""
-    from daytrack.bot import _app
-    user = db.get_user(user_id)
-    if not user:
-        return
-    reminders = get_flow_reminders(db, user_id, "morning")
-    text = (
-        f"{morning_greeting(user['first_name'])}\n\n"
-        f"Your morning reminders:\n{format_reminders(reminders)}\n"
-        f"{morning_plan_prompt()}"
-    )
-    await _app.bot.send_message(chat_id=user_id, text=text)
-    # Store conversation state in user_data via context isn't possible from scheduler,
-    # so we track it in the database by creating a daily plan
+async def handle_morning_entry(query, user):
+    """Show morning info from menu button. User must use /morning to enter the flow."""
     date = today_str(user["timezone"])
-    existing = db.get_daily_plan(user_id, date)
-    if not existing:
-        db.create_daily_plan(user_id, date)
+    plan = db.get_daily_plan(user["user_id"], date)
+    if plan and plan.get("morning_completed_at"):
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 See Plan", callback_data="menu_today")],
+            [InlineKeyboardButton("🏠 Menu", callback_data="menu_main")],
+        ])
+        await query.edit_message_text(morning_already_done(), reply_markup=kb)
+        return
+
+    reminders = get_flow_reminders(db, user["user_id"], "morning")
+    text = (f"{morning_greeting(user['first_name'])}\n\nReminders:\n{format_reminders(reminders)}\n{morning_plan_prompt()}\n\n"
+            "👉 Type /morning to start planning, or just type your tasks below!")
+    await query.edit_message_text(text)
+
+
+async def morning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first! 😊")
+        return ConversationHandler.END
+
+    date = today_str(user["timezone"])
+    plan = db.get_daily_plan(user["user_id"], date)
+    if plan and plan.get("morning_completed_at"):
+        await update.message.reply_text(morning_already_done(), reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📋 See Plan", callback_data="menu_today"),
+             InlineKeyboardButton("🏠 Menu", callback_data="menu_main")]]))
+        return ConversationHandler.END
+
+    reminders = get_flow_reminders(db, user["user_id"], "morning")
+    text = f"{morning_greeting(user['first_name'])}\n\nReminders:\n{format_reminders(reminders)}\n{morning_plan_prompt()}"
+    await update.message.reply_text(text)
+    if not db.get_daily_plan(user["user_id"], date):
+        db.create_daily_plan(user["user_id"], date)
+    return MF_PLAN
 
 
 async def mf_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive plan text, parse with AI, show tasks."""
     user_id = update.effective_user.id
     plan_text = update.message.text.strip()
 
-    # Content moderation
     is_clean, warning = check_content(plan_text)
     if not is_clean:
         await update.message.reply_text(warning)
         return MF_PLAN
 
     user = db.get_user(user_id)
-    date = today_str(user["timezone"])
-
     try:
         tasks = ai.parse_morning_plan(plan_text)
         if not tasks:
-            await update.message.reply_text("I couldn't find any tasks in that. Could you rephrase? 🤔")
+            await update.message.reply_text("Couldn't find tasks. Try again? 🤔")
             return MF_PLAN
-
         context.user_data["parsed_tasks"] = tasks
         context.user_data["raw_plan"] = plan_text
         formatted = format_tasks_by_category(tasks)
-        await update.message.reply_text(morning_tasks_confirmation(formatted))
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Looks good", callback_data="mf_confirm"),
+             InlineKeyboardButton("🔄 Redo", callback_data="mf_redo")],
+        ])
+        await update.message.reply_text(morning_tasks_confirmation(formatted), reply_markup=kb)
         return MF_CONFIRM
     except ContentSafetyError as e:
         await update.message.reply_text(str(e))
         return MF_PLAN
     except Exception as e:
-        logger.error(f"Morning parse failed for user {user_id}: {e}")
-        await update.message.reply_text(
-            "Oops, I had trouble parsing that. Could you try rephrasing your plan? 🙏"
-        )
+        logger.error(f"Morning parse failed: {e}")
+        await update.message.reply_text("Had trouble parsing. Try rephrasing? 🙏")
         return MF_PLAN
 
 
-async def mf_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Confirm or correct parsed tasks."""
+async def mf_confirm_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
     user_id = update.effective_user.id
-    text = update.message.text.strip().lower()
+
+    if query.data == "mf_redo":
+        await query.edit_message_text("No problem! Tell me your plan again 📝")
+        return MF_PLAN
+
+    # Confirm
     user = db.get_user(user_id)
     date = today_str(user["timezone"])
+    tasks = context.user_data.get("parsed_tasks", [])
+    raw = context.user_data.get("raw_plan", "")
 
-    if text in ("yes", "y", "looks good", "perfect", "confirm", "ok", "good", "yep", "yup"):
+    plan = db.get_daily_plan(user_id, date)
+    if not plan:
+        plan_id = db.create_daily_plan(user_id, date)
+    else:
+        plan_id = plan["id"]
+
+    db.update_daily_plan(plan_id, raw_morning_input=raw, morning_completed_at=datetime.utcnow().isoformat())
+    db.create_tasks(plan_id, user_id, date, tasks)
+
+    await query.edit_message_text(morning_tasks_saved(), reply_markup=back_menu_keyboard())
+    return ConversationHandler.END
+
+
+async def mf_confirm_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """If user types text instead of clicking button during confirm."""
+    text = update.message.text.strip().lower()
+    if text in ("yes", "y", "looks good", "ok", "good", "confirm", "yep", "yup"):
+        # Simulate confirm
+        user_id = update.effective_user.id
+        user = db.get_user(user_id)
+        date = today_str(user["timezone"])
         tasks = context.user_data.get("parsed_tasks", [])
         raw = context.user_data.get("raw_plan", "")
-
         plan = db.get_daily_plan(user_id, date)
-        if not plan:
-            plan_id = db.create_daily_plan(user_id, date)
-        else:
-            plan_id = plan["id"]
-
-        db.update_daily_plan(plan_id, raw_morning_input=raw,
-                             morning_completed_at=datetime.utcnow().isoformat())
+        plan_id = plan["id"] if plan else db.create_daily_plan(user_id, date)
+        db.update_daily_plan(plan_id, raw_morning_input=raw, morning_completed_at=datetime.utcnow().isoformat())
         db.create_tasks(plan_id, user_id, date, tasks)
-
-        await update.message.reply_text(morning_tasks_saved())
+        await update.message.reply_text(morning_tasks_saved(), reply_markup=back_menu_keyboard())
         return ConversationHandler.END
     else:
-        # User wants corrections — re-parse with the new input
-        try:
-            tasks = ai.parse_morning_plan(text)
-            if tasks:
-                context.user_data["parsed_tasks"] = tasks
-                context.user_data["raw_plan"] = text
-                formatted = format_tasks_by_category(tasks)
-                await update.message.reply_text(morning_tasks_confirmation(formatted))
-                return MF_CONFIRM
-        except Exception:
-            pass
-        await update.message.reply_text("I'll try again — could you tell me your plan once more? 🤔")
-        return MF_PLAN
+        # Re-parse
+        return await mf_plan(update, context)
 
 
 # ══════════════════════════════════════════════════════════════════════
 # EVENING FLOW
 # ══════════════════════════════════════════════════════════════════════
 
-async def trigger_evening_flow(user_id: int) -> None:
-    """Scheduler callback — send evening greeting to user."""
-    from daytrack.bot import _app
-    user = db.get_user(user_id)
-    if not user:
-        return
+async def handle_evening_entry(query, user):
+    """Show evening info from menu button. User must use /evening to enter the flow."""
     date = today_str(user["timezone"])
-    plan = db.get_daily_plan(user_id, date)
+    plan = db.get_daily_plan(user["user_id"], date)
+    if plan and plan.get("evening_completed_at"):
+        await query.edit_message_text(evening_already_done(), reply_markup=back_menu_keyboard())
+        return
 
     if plan and plan.get("morning_completed_at"):
         tasks = db.get_tasks_for_plan(plan["id"])
-        formatted = format_tasks_by_category([dict(t) for t in tasks])
+        formatted = format_tasks_by_category(tasks)
+        text = f"{evening_greeting(user['first_name'])}\n\n{evening_review_prompt(formatted)}\n\n👉 Type /evening to start your review!"
+    else:
+        text = f"{evening_greeting(user['first_name'])}\n\n{evening_no_plan()}\n\n👉 Type /evening to share your reflection!"
+    await query.edit_message_text(text)
+
+
+async def evening_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first! 😊")
+        return ConversationHandler.END
+
+    date = today_str(user["timezone"])
+    plan = db.get_daily_plan(user["user_id"], date)
+    if plan and plan.get("evening_completed_at"):
+        await update.message.reply_text(evening_already_done(), reply_markup=back_menu_keyboard())
+        return ConversationHandler.END
+
+    if plan and plan.get("morning_completed_at"):
+        tasks = db.get_tasks_for_plan(plan["id"])
+        formatted = format_tasks_by_category(tasks)
         text = f"{evening_greeting(user['first_name'])}\n\n{evening_review_prompt(formatted)}"
     else:
         text = f"{evening_greeting(user['first_name'])}\n\n{evening_no_plan()}"
-
-    await _app.bot.send_message(chat_id=user_id, text=text)
+    await update.message.reply_text(text)
+    return EF_UPDATE
 
 
 async def ef_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Receive evening update, match against tasks."""
     user_id = update.effective_user.id
     update_text = update.message.text.strip()
 
-    # Content moderation
     is_clean, warning = check_content(update_text)
     if not is_clean:
         await update.message.reply_text(warning)
@@ -313,15 +332,16 @@ async def ef_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     plan = db.get_daily_plan(user_id, date)
 
     if not plan or not plan.get("morning_completed_at"):
-        # No morning plan — just save as reflection
         if not plan:
             plan_id = db.create_daily_plan(user_id, date)
         else:
             plan_id = plan["id"]
         db.update_daily_plan(plan_id, raw_evening_input=update_text)
-        await update.message.reply_text(
-            "Thanks for sharing! 💭\n" + evening_memory_prompt()
-        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💭 Save memory", callback_data="ef_memory_yes"),
+             InlineKeyboardButton("⏭️ Skip", callback_data="ef_memory_skip")],
+        ])
+        await update.message.reply_text("Thanks for sharing! 💭\n\n" + evening_memory_prompt(), reply_markup=kb)
         context.user_data["plan_id"] = plan_id
         return EF_MEMORY
 
@@ -330,21 +350,21 @@ async def ef_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     try:
         matched = ai.match_evening_update(task_dicts, update_text)
-        # Update task statuses
         for i, task in enumerate(tasks):
             if i < len(matched):
-                status = matched[i].get("status", "skipped")
-                db.update_task_status(task["id"], status)
+                db.update_task_status(task["id"], matched[i].get("status", "skipped"))
 
-        # Refresh tasks and calculate score
-        updated_tasks = db.get_tasks_for_plan(plan["id"])
-        score = calculate_day_score([dict(t) for t in updated_tasks])
-        status_summary = format_task_status_summary([dict(t) for t in updated_tasks])
-
+        updated = db.get_tasks_for_plan(plan["id"])
+        score = calculate_day_score(updated)
+        summary = format_task_status_summary(updated)
         db.update_daily_plan(plan["id"], raw_evening_input=update_text, day_score=score)
 
-        await update.message.reply_text(evening_score(score, status_summary))
-        await update.message.reply_text(evening_memory_prompt())
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💭 Save memory", callback_data="ef_memory_yes"),
+             InlineKeyboardButton("⏭️ Skip", callback_data="ef_memory_skip")],
+        ])
+        await update.message.reply_text(evening_score(score, summary))
+        await update.message.reply_text(evening_memory_prompt(), reply_markup=kb)
         context.user_data["plan_id"] = plan["id"]
         return EF_MEMORY
 
@@ -352,22 +372,48 @@ async def ef_update(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         await update.message.reply_text(str(e))
         return EF_UPDATE
     except Exception as e:
-        logger.error(f"Evening match failed for user {user_id}: {e}")
+        logger.error(f"Evening match failed: {e}")
         db.update_daily_plan(plan["id"], raw_evening_input=update_text)
-        await update.message.reply_text(
-            "I had trouble matching your update to tasks. No worries though!\n"
-            + evening_memory_prompt()
-        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💭 Save memory", callback_data="ef_memory_yes"),
+             InlineKeyboardButton("⏭️ Skip", callback_data="ef_memory_skip")],
+        ])
+        await update.message.reply_text("Had trouble matching tasks. No worries!\n\n" + evening_memory_prompt(), reply_markup=kb)
         context.user_data["plan_id"] = plan["id"]
         return EF_MEMORY
 
 
-async def ef_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Capture memory or skip, send evening reminders and goodnight."""
+async def ef_memory_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    user_id = update.effective_user.id
+    user = db.get_user(user_id)
+    plan_id = context.user_data.get("plan_id")
+
+    if query.data == "ef_memory_skip":
+        if plan_id:
+            db.update_daily_plan(plan_id, evening_completed_at=datetime.utcnow().isoformat())
+        reminders = get_flow_reminders(db, user_id, "evening")
+        text = f"Evening reminders:\n{format_reminders(reminders)}\n\n{goodnight(user['first_name'])}"
+        await query.edit_message_text(text, reply_markup=back_menu_keyboard())
+
+        # Weekly summary on Sunday
+        tz = pytz.timezone(user["timezone"])
+        if datetime.now(tz).weekday() == 6:
+            await send_weekly_summary(user_id, query.message.reply_text)
+        return ConversationHandler.END
+
+    elif query.data == "ef_memory_yes":
+        await query.edit_message_text("Type your memory or thought 💭")
+        return EF_MEMORY
+
+    return EF_MEMORY
+
+
+async def ef_memory_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user_id = update.effective_user.id
     text = update.message.text.strip()
 
-    # Content moderation
     is_clean, warning = check_content(text)
     if not is_clean:
         await update.message.reply_text(warning)
@@ -375,37 +421,314 @@ async def ef_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     user = db.get_user(user_id)
     plan_id = context.user_data.get("plan_id")
-
-    if text.lower() not in ("no", "skip", "nah", "nope", "pass", "none"):
-        if plan_id:
-            db.update_daily_plan(plan_id, moment=text)
-        await update.message.reply_text(evening_memory_saved())
-
-    # Mark evening complete
     if plan_id:
-        db.update_daily_plan(plan_id, evening_completed_at=datetime.utcnow().isoformat())
+        db.update_daily_plan(plan_id, moment=text, evening_completed_at=datetime.utcnow().isoformat())
 
-    # Send evening reminders
     reminders = get_flow_reminders(db, user_id, "evening")
-    reminder_text = f"\nEvening reminders:\n{format_reminders(reminders)}"
-    await update.message.reply_text(reminder_text)
-    await update.message.reply_text(goodnight(user["first_name"]))
+    await update.message.reply_text(evening_memory_saved())
+    msg = f"Evening reminders:\n{format_reminders(reminders)}\n\n{goodnight(user['first_name'])}"
+    await update.message.reply_text(msg, reply_markup=back_menu_keyboard())
 
-    # Check if Sunday — trigger weekly summary
     tz = pytz.timezone(user["timezone"])
-    now = datetime.now(tz)
-    if now.weekday() == 6:  # Sunday
+    if datetime.now(tz).weekday() == 6:
         await send_weekly_summary(user_id, update.message.reply_text)
-
     return ConversationHandler.END
 
 
-async def send_weekly_summary(user_id: int, reply_func) -> None:
-    """Generate and send weekly summary."""
+# ══════════════════════════════════════════════════════════════════════
+# SETTINGS
+# ══════════════════════════════════════════════════════════════════════
+
+SETTINGS_KB = InlineKeyboardMarkup([
+    [InlineKeyboardButton("👤 Name", callback_data="set_name"),
+     InlineKeyboardButton("☀️ Morning Time", callback_data="set_morning")],
+    [InlineKeyboardButton("🌙 Evening Time", callback_data="set_evening")],
+    [InlineKeyboardButton("🌅 Morning Reminders", callback_data="set_mrem"),
+     InlineKeyboardButton("🌙 Evening Reminders", callback_data="set_erem")],
+    [InlineKeyboardButton("🏠 Back", callback_data="menu_main")],
+])
+
+
+async def handle_settings_display(query, user):
+    text = settings_display(user["first_name"], user["timezone"], user["morning_time"], user["evening_time"])
+    await query.edit_message_text(text, reply_markup=SETTINGS_KB)
+
+
+async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first! 😊")
+        return ConversationHandler.END
+    text = settings_display(user["first_name"], user["timezone"], user["morning_time"], user["evening_time"])
+    await update.message.reply_text(text, reply_markup=SETTINGS_KB)
+    return ST_CHOOSE
+
+
+async def st_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data
+
+    if choice == "menu_main":
+        user = db.get_user(update.effective_user.id)
+        await query.edit_message_text(welcome_back(user["first_name"]), reply_markup=main_menu_keyboard())
+        return ConversationHandler.END
+    elif choice == "set_name":
+        context.user_data["setting"] = "first_name"
+        await query.edit_message_text("What should I call you?")
+        return ST_VALUE
+    elif choice == "set_morning":
+        context.user_data["setting"] = "morning_time"
+        await query.edit_message_text("Morning time? (HH:MM, 24hr)\nExample: 07:00")
+        return ST_VALUE
+    elif choice == "set_evening":
+        context.user_data["setting"] = "evening_time"
+        await query.edit_message_text("Evening time? (HH:MM, 24hr)\nExample: 23:00")
+        return ST_VALUE
+    elif choice in ("set_mrem", "set_erem"):
+        flow = "morning" if choice == "set_mrem" else "evening"
+        context.user_data["rem_flow"] = flow
+        return await show_rem_menu(query, update.effective_user.id, flow)
+
+    return ST_CHOOSE
+
+
+async def st_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user_id = update.effective_user.id
+    text = update.message.text.strip()
+    setting = context.user_data.get("setting")
+
+    if setting in ("morning_time", "evening_time"):
+        if not validate_time_format(text):
+            await update.message.reply_text("Use HH:MM format (24hr), like 07:00")
+            return ST_VALUE
+        db.update_user_setting(user_id, setting, text)
+        user = db.get_user(user_id)
+        reschedule_user_flows(user_id, user["morning_time"], user["evening_time"],
+                              user["timezone"], trigger_morning_flow, trigger_evening_flow)
+    elif setting == "first_name":
+        is_clean, warning = check_content(text)
+        if not is_clean:
+            await update.message.reply_text(warning)
+            return ST_VALUE
+        db.update_user_setting(user_id, "first_name", text)
+
+    user = db.get_user(user_id)
+    await update.message.reply_text(
+        f"Updated! ✅\n\n{settings_display(user['first_name'], user['timezone'], user['morning_time'], user['evening_time'])}",
+        reply_markup=SETTINGS_KB)
+    return ST_CHOOSE
+
+
+async def show_rem_menu(query, user_id, flow):
+    reminders = db.get_reminders(user_id, flow)
+    if reminders:
+        lines = [f"  {i+1}. {r['reminder_text']}" for i, r in enumerate(reminders)]
+        text = f"Your {flow} reminders:\n" + "\n".join(lines)
+    else:
+        text = f"No {flow} reminders (using defaults)."
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add", callback_data="rem_add"),
+         InlineKeyboardButton("➖ Remove", callback_data="rem_remove")],
+        [InlineKeyboardButton("✅ Done", callback_data="rem_done")],
+    ])
+    await query.edit_message_text(text, reply_markup=kb)
+    return ST_REM_ACTION
+
+
+async def st_rem_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    flow = context.user_data.get("rem_flow", "morning")
+    user_id = update.effective_user.id
+
+    if query.data == "rem_done":
+        user = db.get_user(user_id)
+        await query.edit_message_text(
+            settings_display(user["first_name"], user["timezone"], user["morning_time"], user["evening_time"]),
+            reply_markup=SETTINGS_KB)
+        return ST_CHOOSE
+    elif query.data == "rem_add":
+        if db.get_reminder_count(user_id, flow) >= 10:
+            await query.edit_message_text("Max 10 reminders! Remove one first.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="rem_done")]]))
+            return ST_REM_ACTION
+        await query.edit_message_text(f"Type your new {flow} reminder:")
+        return ST_REM_ADD
+    elif query.data == "rem_remove":
+        reminders = db.get_reminders(user_id, flow)
+        if not reminders:
+            return await show_rem_menu(query, user_id, flow)
+        kb = [[InlineKeyboardButton(f"❌ {r['reminder_text'][:30]}", callback_data=f"remid_{r['id']}")]
+              for r in reminders]
+        kb.append([InlineKeyboardButton("⬅️ Back", callback_data="rem_done")])
+        await query.edit_message_text("Tap to remove:", reply_markup=InlineKeyboardMarkup(kb))
+        return ST_REM_REMOVE
+    return ST_REM_ACTION
+
+
+async def st_rem_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()[:100]
+    user_id = update.effective_user.id
+    flow = context.user_data.get("rem_flow", "morning")
+    db.add_reminder(user_id, flow, text)
+    reminders = db.get_reminders(user_id, flow)
+    lines = [f"  {i+1}. {r['reminder_text']}" for i, r in enumerate(reminders)]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add", callback_data="rem_add"),
+         InlineKeyboardButton("➖ Remove", callback_data="rem_remove")],
+        [InlineKeyboardButton("✅ Done", callback_data="rem_done")],
+    ])
+    await update.message.reply_text(f"Added! ✅\n\n{flow.title()} reminders:\n" + "\n".join(lines), reply_markup=kb)
+    return ST_REM_ACTION
+
+
+async def st_rem_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    if query.data == "rem_done":
+        user = db.get_user(update.effective_user.id)
+        await query.edit_message_text(
+            settings_display(user["first_name"], user["timezone"], user["morning_time"], user["evening_time"]),
+            reply_markup=SETTINGS_KB)
+        return ST_CHOOSE
+    if query.data.startswith("remid_"):
+        rid = int(query.data.split("_")[1])
+        db.remove_reminder(rid, update.effective_user.id)
+    flow = context.user_data.get("rem_flow", "morning")
+    return await show_rem_menu(query, update.effective_user.id, flow)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# STANDALONE HANDLERS
+# ══════════════════════════════════════════════════════════════════════
+
+async def handle_today(query, user):
+    date = today_str(user["timezone"])
+    plan = db.get_daily_plan(user["user_id"], date)
+    if not plan:
+        await query.edit_message_text("No plan yet today. Tap ☀️ Morning to start!", reply_markup=back_menu_keyboard())
+        return
+    tasks = db.get_tasks_for_plan(plan["id"])
+    if not tasks:
+        await query.edit_message_text("Plan started but no tasks yet.", reply_markup=back_menu_keyboard())
+        return
+    formatted = format_tasks_by_category(tasks)
+    status = format_task_status_summary(tasks)
+    score = calculate_day_score(tasks)
+    await query.edit_message_text(f"📋 Today ({date}):\n{formatted}\n\n📊 Status:\n{status}\n\n🎯 Score: {score}",
+                                  reply_markup=back_menu_keyboard())
+
+
+async def handle_memories(query, user_id):
+    mem = db.get_random_memory(user_id)
+    if mem:
+        await query.edit_message_text(memory_recall(mem["moment"], mem["plan_date"]), reply_markup=back_menu_keyboard())
+    else:
+        await query.edit_message_text(no_memories(), reply_markup=back_menu_keyboard())
+
+
+async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = db.get_user(update.effective_user.id)
+    if not user:
+        await update.message.reply_text("Please /start first! 😊")
+        return
+    date = today_str(user["timezone"])
+    plan = db.get_daily_plan(user["user_id"], date)
+    if not plan:
+        await update.message.reply_text("No plan yet. Tap ☀️ Morning!", reply_markup=main_menu_keyboard())
+        return
+    tasks = db.get_tasks_for_plan(plan["id"])
+    if not tasks:
+        await update.message.reply_text("Plan started, no tasks yet.", reply_markup=back_menu_keyboard())
+        return
+    formatted = format_tasks_by_category(tasks)
+    score = calculate_day_score(tasks)
+    await update.message.reply_text(f"📋 Today:\n{formatted}\n\n🎯 Score: {score}", reply_markup=back_menu_keyboard())
+
+
+async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    mem = db.get_random_memory(update.effective_user.id)
+    if mem:
+        await update.message.reply_text(memory_recall(mem["moment"], mem["plan_date"]), reply_markup=back_menu_keyboard())
+    else:
+        await update.message.reply_text(no_memories(), reply_markup=back_menu_keyboard())
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(help_text(), reply_markup=main_menu_keyboard())
+
+
+async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(voice_not_supported(), reply_markup=main_menu_keyboard())
+
+
+async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = db.get_user(update.effective_user.id)
+    if user:
+        # Check if this might be a plan (user typed tasks after clicking morning button)
+        date = today_str(user["timezone"])
+        plan = db.get_daily_plan(user["user_id"], date)
+        if plan and not plan.get("morning_completed_at"):
+            # They might be trying to enter tasks — guide them
+            await update.message.reply_text(
+                "Looks like you're trying to add tasks! Use /morning to start planning. 📝",
+                reply_markup=main_menu_keyboard())
+        else:
+            await update.message.reply_text(fallback_msg(), reply_markup=main_menu_keyboard())
+    else:
+        await update.message.reply_text("Hey! Tap /start to get started 😊")
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.error(f"Error: {context.error}", exc_info=context.error)
+
+
+# ══════════════════════════════════════════════════════════════════════
+# SCHEDULER TRIGGERS
+# ══════════════════════════════════════════════════════════════════════
+
+async def trigger_morning_flow(user_id: int) -> None:
     user = db.get_user(user_id)
     if not user:
         return
+    date = today_str(user["timezone"])
+    plan = db.get_daily_plan(user_id, date)
+    if plan and plan.get("morning_completed_at"):
+        return  # Already done today
 
+    reminders = get_flow_reminders(db, user_id, "morning")
+    text = f"{morning_greeting(user['first_name'])}\n\nReminders:\n{format_reminders(reminders)}\n{morning_plan_prompt()}"
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("☀️ Start Planning", callback_data="menu_morning")]])
+    await _app.bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
+    if not plan:
+        db.create_daily_plan(user_id, date)
+
+
+async def trigger_evening_flow(user_id: int) -> None:
+    user = db.get_user(user_id)
+    if not user:
+        return
+    date = today_str(user["timezone"])
+    plan = db.get_daily_plan(user_id, date)
+    if plan and plan.get("evening_completed_at"):
+        return  # Already done today
+
+    if plan and plan.get("morning_completed_at"):
+        tasks = db.get_tasks_for_plan(plan["id"])
+        formatted = format_tasks_by_category(tasks)
+        text = f"{evening_greeting(user['first_name'])}\n\n{evening_review_prompt(formatted)}"
+    else:
+        text = f"{evening_greeting(user['first_name'])}\n\n{evening_no_plan()}"
+
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🌙 Start Review", callback_data="menu_evening")]])
+    await _app.bot.send_message(chat_id=user_id, text=text, reply_markup=kb)
+
+
+async def send_weekly_summary(user_id: int, reply_func) -> None:
+    user = db.get_user(user_id)
+    if not user:
+        return
     tz = pytz.timezone(user["timezone"])
     now = datetime.now(tz)
     week_end = now.strftime("%Y-%m-%d")
@@ -421,417 +744,97 @@ async def send_weekly_summary(user_id: int, reply_func) -> None:
     partial = sum(1 for t in tasks if t["status"] == "partial")
     skipped = sum(1 for t in tasks if t["status"] == "skipped")
     score_pct = round((completed / total) * 100, 1) if total > 0 else 0
-
-    # Category breakdown
     cat_breakdown = {}
     for t in tasks:
         cat_breakdown[t["category"]] = cat_breakdown.get(t["category"], 0) + 1
-
     streak = db.calculate_streak(user_id)
 
-    # AI insight
-    week_data = {
-        "total_tasks": total, "completed": completed, "partial": partial,
-        "skipped": skipped, "score_percentage": score_pct,
-        "category_breakdown": cat_breakdown, "streak_days": streak,
-    }
     try:
-        insight = ai.generate_weekly_insight(week_data)
+        insight = ai.generate_weekly_insight({
+            "total_tasks": total, "completed": completed, "partial": partial,
+            "skipped": skipped, "score_percentage": score_pct,
+            "category_breakdown": cat_breakdown, "streak_days": streak})
     except Exception:
-        insight = {"summary": "Great week! Keep it up.", "suggestions": "Stay consistent."}
+        insight = {"summary": "Keep it up!", "suggestions": "Stay consistent."}
 
-    # Store summary
-    summary_data = {
-        "week_start": week_start, "week_end": week_end,
-        "total_tasks": total, "completed_tasks": completed,
-        "partial_tasks": partial, "skipped_tasks": skipped,
-        "score_percentage": score_pct,
-        "category_breakdown": json.dumps(cat_breakdown),
-        "ai_summary": insight.get("summary", ""),
-        "ai_suggestions": insight.get("suggestions", ""),
-        "streak_days": streak,
-    }
-    db.create_weekly_summary(user_id, summary_data)
+    db.create_weekly_summary(user_id, {
+        "week_start": week_start, "week_end": week_end, "total_tasks": total,
+        "completed_tasks": completed, "partial_tasks": partial, "skipped_tasks": skipped,
+        "score_percentage": score_pct, "category_breakdown": json.dumps(cat_breakdown),
+        "ai_summary": insight.get("summary", ""), "ai_suggestions": insight.get("suggestions", ""),
+        "streak_days": streak})
 
-    # Format and send
-    emoji_map = {"work": "💼", "health": "🏃", "personal": "🏠", "learning": "📚", "other": "📌"}
-    cat_lines = "\n".join(f"  {emoji_map.get(c, '📌')} {c.title()}: {n}" for c, n in cat_breakdown.items())
-
-    msg = (
-        f"{weekly_summary_header()}\n\n"
-        f"📈 Score: {score_pct}% ({completed}/{total} completed)\n"
-        f"🔶 Partial: {partial} | ⏭️ Skipped: {skipped}\n\n"
-        f"📊 Categories:\n{cat_lines}\n\n"
-        f"🔥 Streak: {streak} days\n\n"
-        f"💭 {insight.get('summary', '')}\n\n"
-        f"💡 {insight.get('suggestions', '')}"
-    )
+    emoji = {"work": "💼", "health": "🏃", "personal": "🏠", "learning": "📚", "other": "📌"}
+    cats = "\n".join(f"  {emoji.get(c,'📌')} {c.title()}: {n}" for c, n in cat_breakdown.items())
+    msg = (f"{weekly_summary_header()}\n\n📈 {score_pct}% ({completed}/{total})\n"
+           f"🔶 Partial: {partial} | ⏭️ Skipped: {skipped}\n\n📊 Categories:\n{cats}\n\n"
+           f"🔥 Streak: {streak} days\n\n💭 {insight.get('summary','')}\n💡 {insight.get('suggestions','')}")
     await reply_func(msg)
 
 
 # ══════════════════════════════════════════════════════════════════════
-# SETTINGS FLOW
+# APP SETUP
 # ══════════════════════════════════════════════════════════════════════
 
-SETTINGS_OPTIONS = [
-    [InlineKeyboardButton("👤 Name", callback_data="set_name")],
-    [InlineKeyboardButton("🌍 Timezone", callback_data="set_timezone")],
-    [InlineKeyboardButton("☀️ Morning Time", callback_data="set_morning")],
-    [InlineKeyboardButton("🌙 Evening Time", callback_data="set_evening")],
-    [InlineKeyboardButton("🌅 Morning Reminders", callback_data="set_mreminders")],
-    [InlineKeyboardButton("🌙 Evening Reminders", callback_data="set_ereminders")],
-    [InlineKeyboardButton("✅ Done", callback_data="set_done")],
-]
-
-
-async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /settings — show current settings."""
-    user = db.get_user(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Please run /start first to set up your profile! 😊")
-        return ConversationHandler.END
-
-    text = settings_menu(user["first_name"], user["timezone"], user["morning_time"], user["evening_time"])
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(SETTINGS_OPTIONS))
-    return ST_CHOOSE
-
-
-async def st_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle settings menu selection."""
-    query = update.callback_query
-    await query.answer()
-    choice = query.data
-
-    if choice == "set_done":
-        await query.edit_message_text("Settings saved! 👍")
-        return ConversationHandler.END
-    elif choice == "set_name":
-        context.user_data["setting"] = "first_name"
-        await query.edit_message_text("What should I call you?")
-        return ST_VALUE
-    elif choice == "set_timezone":
-        context.user_data["setting"] = "timezone"
-        await query.edit_message_text(ask_timezone())
-        return ST_VALUE
-    elif choice == "set_morning":
-        context.user_data["setting"] = "morning_time"
-        await query.edit_message_text(ask_morning_time())
-        return ST_VALUE
-    elif choice == "set_evening":
-        context.user_data["setting"] = "evening_time"
-        await query.edit_message_text(ask_evening_time())
-        return ST_VALUE
-    elif choice in ("set_mreminders", "set_ereminders"):
-        flow = "morning" if choice == "set_mreminders" else "evening"
-        context.user_data["reminder_flow"] = flow
-        return await show_reminder_menu(query, update.effective_user.id, flow)
-
-    return ST_CHOOSE
-
-
-async def st_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle settings value input."""
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-    setting = context.user_data.get("setting")
-
-    if setting == "timezone":
-        if text.lower() == "skip":
-            pass
-        elif not validate_timezone(text):
-            await update.message.reply_text(f"'{text}' isn't a valid timezone. Try again?")
-            return ST_VALUE
-        else:
-            db.update_user_setting(user_id, "timezone", text)
-    elif setting in ("morning_time", "evening_time"):
-        if text.lower() == "skip":
-            pass
-        elif not validate_time_format(text):
-            await update.message.reply_text("Please use HH:MM format (24-hour), like 07:00")
-            return ST_VALUE
-        else:
-            db.update_user_setting(user_id, setting, text)
-    elif setting == "first_name":
-        db.update_user_setting(user_id, "first_name", text)
-    else:
-        await update.message.reply_text("Something went wrong. Try /settings again.")
-        return ConversationHandler.END
-
-    # Reschedule if time/timezone changed
-    if setting in ("morning_time", "evening_time", "timezone"):
-        user = db.get_user(user_id)
-        reschedule_user_flows(
-            user_id, user["morning_time"], user["evening_time"], user["timezone"],
-            trigger_morning_flow, trigger_evening_flow,
-        )
-
-    await update.message.reply_text("Updated! ✅", reply_markup=InlineKeyboardMarkup(SETTINGS_OPTIONS))
-    return ST_CHOOSE
-
-
-async def show_reminder_menu(query, user_id: int, flow: str) -> int:
-    """Show current reminders with add/remove/done options."""
-    reminders = db.get_reminders(user_id, flow)
-    if reminders:
-        lines = [f"  {i+1}. {r['reminder_text']}" for i, r in enumerate(reminders)]
-        text = f"Your {flow} reminders:\n" + "\n".join(lines)
-    else:
-        text = f"No custom {flow} reminders set (using defaults)."
-
-    keyboard = [
-        [InlineKeyboardButton("➕ Add", callback_data="rem_add"),
-         InlineKeyboardButton("➖ Remove", callback_data="rem_remove"),
-         InlineKeyboardButton("✅ Done", callback_data="rem_done")],
-    ]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
-    return ST_REMINDER_ACTION
-
-
-async def st_reminder_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle reminder add/remove/done."""
-    query = update.callback_query
-    await query.answer()
-    choice = query.data
-    flow = context.user_data.get("reminder_flow", "morning")
-
-    if choice == "rem_done":
-        await query.edit_message_text("Reminders saved! ✅", reply_markup=InlineKeyboardMarkup(SETTINGS_OPTIONS))
-        return ST_CHOOSE
-    elif choice == "rem_add":
-        count = db.get_reminder_count(update.effective_user.id, flow)
-        if count >= 10:
-            await query.edit_message_text(
-                f"You've hit the max of 10 {flow} reminders. Remove one first!",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="rem_done")]]),
-            )
-            return ST_REMINDER_ACTION
-        await query.edit_message_text(f"Type your new {flow} reminder (max 100 chars):")
-        return ST_REMINDER_ADD
-    elif choice == "rem_remove":
-        reminders = db.get_reminders(update.effective_user.id, flow)
-        if not reminders:
-            await query.edit_message_text("No reminders to remove!")
-            return await show_reminder_menu(query, update.effective_user.id, flow)
-        keyboard = [[InlineKeyboardButton(f"{i+1}. {r['reminder_text'][:30]}", callback_data=f"remid_{r['id']}")]
-                     for i, r in enumerate(reminders)]
-        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data="rem_done")])
-        await query.edit_message_text("Which reminder to remove?", reply_markup=InlineKeyboardMarkup(keyboard))
-        return ST_REMINDER_REMOVE
-
-    return ST_REMINDER_ACTION
-
-
-async def st_reminder_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Add a new reminder."""
-    text = update.message.text.strip()[:100]
-    user_id = update.effective_user.id
-    flow = context.user_data.get("reminder_flow", "morning")
-
-    if db.add_reminder(user_id, flow, text):
-        await update.message.reply_text(f"Added: {text} ✅")
-    else:
-        await update.message.reply_text("Couldn't add — you might be at the limit.")
-
-    # Show menu again
-    reminders = db.get_reminders(user_id, flow)
-    lines = [f"  {i+1}. {r['reminder_text']}" for i, r in enumerate(reminders)]
-    msg = f"Your {flow} reminders:\n" + "\n".join(lines)
-    keyboard = [
-        [InlineKeyboardButton("➕ Add", callback_data="rem_add"),
-         InlineKeyboardButton("➖ Remove", callback_data="rem_remove"),
-         InlineKeyboardButton("✅ Done", callback_data="rem_done")],
-    ]
-    await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
-    return ST_REMINDER_ACTION
-
-
-async def st_reminder_remove(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Remove a reminder by callback."""
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "rem_done":
-        await query.edit_message_text("Reminders saved! ✅", reply_markup=InlineKeyboardMarkup(SETTINGS_OPTIONS))
-        return ST_CHOOSE
-
-    if data.startswith("remid_"):
-        reminder_id = int(data.split("_")[1])
-        db.remove_reminder(reminder_id, update.effective_user.id)
-
-    flow = context.user_data.get("reminder_flow", "morning")
-    return await show_reminder_menu(query, update.effective_user.id, flow)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# MORNING / EVENING COMMAND ENTRY POINTS
-# ══════════════════════════════════════════════════════════════════════
-
-async def morning_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /morning — start morning planning flow."""
-    user = db.get_user(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Please run /start first! 😊")
-        return ConversationHandler.END
-    reminders = get_flow_reminders(db, user["user_id"], "morning")
-    text = (
-        f"{morning_greeting(user['first_name'])}\n\n"
-        f"Your morning reminders:\n{format_reminders(reminders)}\n"
-        f"{morning_plan_prompt()}"
-    )
-    await update.message.reply_text(text)
-    date = today_str(user["timezone"])
-    if not db.get_daily_plan(user["user_id"], date):
-        db.create_daily_plan(user["user_id"], date)
-    return MF_PLAN
-
-
-async def evening_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle /evening — start evening review flow."""
-    user = db.get_user(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Please run /start first! 😊")
-        return ConversationHandler.END
-    date = today_str(user["timezone"])
-    plan = db.get_daily_plan(user["user_id"], date)
-    if plan and plan.get("morning_completed_at"):
-        tasks = db.get_tasks_for_plan(plan["id"])
-        formatted = format_tasks_by_category([dict(t) for t in tasks])
-        text = f"{evening_greeting(user['first_name'])}\n\n{evening_review_prompt(formatted)}"
-    else:
-        text = f"{evening_greeting(user['first_name'])}\n\n{evening_no_plan()}"
-    await update.message.reply_text(text)
-    return EF_UPDATE
-
-
-# ══════════════════════════════════════════════════════════════════════
-# STANDALONE COMMANDS
-# ══════════════════════════════════════════════════════════════════════
-
-async def today_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /today — show today's plan and task statuses."""
-    user = db.get_user(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Please run /start first! 😊")
-        return
-    date = today_str(user["timezone"])
-    plan = db.get_daily_plan(user.get("user_id"), date)
-    if not plan:
-        await update.message.reply_text("No plan set for today yet. I'll ask you during your morning check-in! ☀️")
-        return
-    tasks = db.get_tasks_for_plan(plan["id"])
-    if not tasks:
-        await update.message.reply_text("You have a plan started but no tasks parsed yet. Hang tight! 📝")
-        return
-    formatted = format_tasks_by_category([dict(t) for t in tasks])
-    status = format_task_status_summary([dict(t) for t in tasks])
-    score = calculate_day_score([dict(t) for t in tasks])
-    await update.message.reply_text(f"📋 Today's plan ({date}):\n{formatted}\n\n📊 Status:\n{status}\n\n🎯 Score: {score}")
-
-
-async def memories_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /memories — show a random past memory."""
-    user_id = update.effective_user.id
-    memory = db.get_random_memory(user_id)
-    if memory:
-        await update.message.reply_text(memory_recall(memory["moment"], memory["plan_date"]))
-    else:
-        await update.message.reply_text(no_memories())
-
-
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle /help — list available commands."""
-    await update.message.reply_text(help_text())
-
-
-async def voice_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle voice messages — politely decline."""
-    await update.message.reply_text(voice_not_supported())
-
-
-async def fallback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handle unrecognized messages outside conversations."""
-    await update.message.reply_text(fallback())
-
-
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log errors."""
-    logger.error(f"Exception while handling update: {context.error}", exc_info=context.error)
-
-
-# ══════════════════════════════════════════════════════════════════════
-# APPLICATION SETUP
-# ══════════════════════════════════════════════════════════════════════
-
-# Global app reference for scheduler callbacks
 _app: Application = None  # type: ignore
 
 
 def create_app(token: str, database: DatabaseManager, ai_client: GroqAIClient) -> Application:
-    """Build and configure the Telegram bot application."""
     global db, ai, _app
-
     db = database
     ai = ai_client
 
     app = Application.builder().token(token).build()
     _app = app
 
-    # Onboarding conversation (simplified — just name + reminders)
-    onboarding_handler = ConversationHandler(
+    # Onboarding
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("start", start_command)],
-        states={
-            OB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_name)],
-            OB_REMINDERS: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_reminders)],
-        },
-        fallbacks=[
-            CommandHandler("cancel", ob_cancel),
-            MessageHandler(filters.COMMAND, ob_command_during_setup),
-        ],
-        name="onboarding",
-    )
+        states={OB_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, ob_name)]},
+        fallbacks=[MessageHandler(filters.COMMAND, ob_command_fallback)],
+        name="onboarding"))
 
-    # Morning flow conversation (entry via /morning command or scheduler)
-    morning_handler = ConversationHandler(
+    # Morning flow
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("morning", morning_command)],
         states={
             MF_PLAN: [MessageHandler(filters.TEXT & ~filters.COMMAND, mf_plan)],
-            MF_CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, mf_confirm)],
+            MF_CONFIRM: [
+                CallbackQueryHandler(mf_confirm_callback, pattern="^mf_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, mf_confirm_text)],
         },
-        fallbacks=[CommandHandler("cancel", ob_cancel)],
-        name="morning_flow",
-    )
+        fallbacks=[CommandHandler("cancel", cancel_handler)],
+        name="morning"))
 
-    # Evening flow conversation (entry via /evening command or scheduler)
-    evening_handler = ConversationHandler(
+    # Evening flow
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("evening", evening_command)],
         states={
             EF_UPDATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, ef_update)],
-            EF_MEMORY: [MessageHandler(filters.TEXT & ~filters.COMMAND, ef_memory)],
+            EF_MEMORY: [
+                CallbackQueryHandler(ef_memory_callback, pattern="^ef_memory_"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, ef_memory_text)],
         },
-        fallbacks=[CommandHandler("cancel", ob_cancel)],
-        name="evening_flow",
-    )
+        fallbacks=[CommandHandler("cancel", cancel_handler)],
+        name="evening"))
 
-    # Settings conversation
-    settings_handler = ConversationHandler(
+    # Settings
+    app.add_handler(ConversationHandler(
         entry_points=[CommandHandler("settings", settings_command)],
         states={
             ST_CHOOSE: [CallbackQueryHandler(st_choose)],
             ST_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_value)],
-            ST_REMINDER_ACTION: [CallbackQueryHandler(st_reminder_action)],
-            ST_REMINDER_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_reminder_add)],
-            ST_REMINDER_REMOVE: [CallbackQueryHandler(st_reminder_remove)],
+            ST_REM_ACTION: [CallbackQueryHandler(st_rem_action)],
+            ST_REM_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, st_rem_add)],
+            ST_REM_REMOVE: [CallbackQueryHandler(st_rem_remove)],
         },
-        fallbacks=[CommandHandler("cancel", ob_cancel)],
-        name="settings",
-    )
+        fallbacks=[CommandHandler("cancel", cancel_handler)],
+        name="settings"))
 
-    # Register handlers (order matters)
-    app.add_handler(onboarding_handler)
-    app.add_handler(morning_handler)
-    app.add_handler(evening_handler)
-    app.add_handler(settings_handler)
+    # Menu callbacks (outside conversations)
+    app.add_handler(CallbackQueryHandler(menu_callback, pattern="^menu_"))
+
+    # Standalone commands
     app.add_handler(CommandHandler("today", today_command))
     app.add_handler(CommandHandler("memories", memories_command))
     app.add_handler(CommandHandler("help", help_command))
