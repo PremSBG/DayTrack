@@ -455,13 +455,18 @@ async def handle_settings_display(query, user):
 
 
 async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    user = db.get_user(update.effective_user.id)
-    if not user:
-        await update.message.reply_text("Please /start first! 😊")
+    try:
+        user = db.get_user(update.effective_user.id)
+        if not user:
+            await update.message.reply_text("Please /start first! 😊")
+            return ConversationHandler.END
+        text = settings_display(user["first_name"], user["timezone"], user["morning_time"], user["evening_time"])
+        await update.message.reply_text(text, reply_markup=SETTINGS_KB)
+        return ST_CHOOSE
+    except Exception as e:
+        logger.error(f"Error in settings_command: {e}")
+        await update.message.reply_text("Sorry, there was an error. Please try again.")
         return ConversationHandler.END
-    text = settings_display(user["first_name"], user["timezone"], user["morning_time"], user["evening_time"])
-    await update.message.reply_text(text, reply_markup=SETTINGS_KB)
-    return ST_CHOOSE
 
 
 async def st_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -469,28 +474,33 @@ async def st_choose(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await query.answer()
     choice = query.data
 
-    if choice == "menu_main":
-        user = db.get_user(update.effective_user.id)
-        await query.edit_message_text(welcome_back(user["first_name"]), reply_markup=main_menu_keyboard())
-        return ConversationHandler.END
-    elif choice == "set_name":
-        context.user_data["setting"] = "first_name"
-        await query.edit_message_text("What should I call you?")
-        return ST_VALUE
-    elif choice == "set_morning":
-        context.user_data["setting"] = "morning_time"
-        await query.edit_message_text("Morning time? (HH:MM, 24hr)\nExample: 07:00")
-        return ST_VALUE
-    elif choice == "set_evening":
-        context.user_data["setting"] = "evening_time"
-        await query.edit_message_text("Evening time? (HH:MM, 24hr)\nExample: 23:00")
-        return ST_VALUE
-    elif choice in ("set_mrem", "set_erem"):
-        flow = "morning" if choice == "set_mrem" else "evening"
-        context.user_data["rem_flow"] = flow
-        return await show_rem_menu(query, update.effective_user.id, flow)
+    try:
+        if choice == "menu_main":
+            user = db.get_user(update.effective_user.id)
+            await query.edit_message_text(welcome_back(user["first_name"]), reply_markup=main_menu_keyboard())
+            return ConversationHandler.END
+        elif choice == "set_name":
+            context.user_data["setting"] = "first_name"
+            await query.edit_message_text("What should I call you?")
+            return ST_VALUE
+        elif choice == "set_morning":
+            context.user_data["setting"] = "morning_time"
+            await query.edit_message_text("Morning time? (HH:MM, 24hr)\nExample: 07:00")
+            return ST_VALUE
+        elif choice == "set_evening":
+            context.user_data["setting"] = "evening_time"
+            await query.edit_message_text("Evening time? (HH:MM, 24hr)\nExample: 23:00")
+            return ST_VALUE
+        elif choice in ("set_mrem", "set_erem"):
+            flow = "morning" if choice == "set_mrem" else "evening"
+            context.user_data["rem_flow"] = flow
+            return await show_rem_menu(query, update.effective_user.id, flow)
 
-    return ST_CHOOSE
+        return ST_CHOOSE
+    except Exception as e:
+        logger.error(f"Error in st_choose: {e}")
+        await query.edit_message_text("Sorry, there was an error. Please try /settings again.")
+        return ConversationHandler.END
 
 
 async def st_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -502,38 +512,51 @@ async def st_value(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         if not validate_time_format(text):
             await update.message.reply_text("Use HH:MM format (24hr), like 07:00")
             return ST_VALUE
-        db.update_user_setting(user_id, setting, text)
-        user = db.get_user(user_id)
-        reschedule_user_flows(user_id, user["morning_time"], user["evening_time"],
-                              user["timezone"], trigger_morning_flow, trigger_evening_flow)
     elif setting == "first_name":
         is_clean, warning = check_content(text)
         if not is_clean:
             await update.message.reply_text(warning)
             return ST_VALUE
-        db.update_user_setting(user_id, "first_name", text)
 
-    user = db.get_user(user_id)
-    await update.message.reply_text(
-        f"Updated! ✅\n\n{settings_display(user['first_name'], user['timezone'], user['morning_time'], user['evening_time'])}",
-        reply_markup=SETTINGS_KB)
-    return ST_CHOOSE
+    try:
+        if setting in ("morning_time", "evening_time"):
+            db.update_user_setting(user_id, setting, text)
+            user = db.get_user(user_id)
+            reschedule_user_flows(user_id, user["morning_time"], user["evening_time"],
+                                  user["timezone"], trigger_morning_flow, trigger_evening_flow)
+        elif setting == "first_name":
+            db.update_user_setting(user_id, "first_name", text)
+
+        user = db.get_user(user_id)
+        await update.message.reply_text(
+            f"Updated! ✅\n\n{settings_display(user['first_name'], user['timezone'], user['morning_time'], user['evening_time'])}",
+            reply_markup=SETTINGS_KB)
+        return ST_CHOOSE
+    except Exception as e:
+        logger.error(f"Error updating setting: {e}")
+        await update.message.reply_text("Sorry, there was an error updating your settings. Please try again.")
+        return ST_CHOOSE
 
 
 async def show_rem_menu(query, user_id, flow):
-    reminders = db.get_reminders(user_id, flow)
-    if reminders:
-        lines = [f"  {i+1}. {r['reminder_text']}" for i, r in enumerate(reminders)]
-        text = f"Your {flow} reminders:\n" + "\n".join(lines)
-    else:
-        text = f"No {flow} reminders (using defaults)."
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Add", callback_data="rem_add"),
-         InlineKeyboardButton("➖ Remove", callback_data="rem_remove")],
-        [InlineKeyboardButton("✅ Done", callback_data="rem_done")],
-    ])
-    await query.edit_message_text(text, reply_markup=kb)
-    return ST_REM_ACTION
+    try:
+        reminders = db.get_reminders(user_id, flow)
+        if reminders:
+            lines = [f"  {i+1}. {r['reminder_text']}" for i, r in enumerate(reminders)]
+            text = f"Your {flow} reminders:\n" + "\n".join(lines)
+        else:
+            text = f"No {flow} reminders (using defaults)."
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ Add", callback_data="rem_add"),
+             InlineKeyboardButton("➖ Remove", callback_data="rem_remove")],
+            [InlineKeyboardButton("✅ Done", callback_data="rem_done")],
+        ])
+        await query.edit_message_text(text, reply_markup=kb)
+        return ST_REM_ACTION
+    except Exception as e:
+        logger.error(f"Error in show_rem_menu: {e}")
+        await query.edit_message_text("Sorry, there was an error. Please try /settings again.")
+        return ConversationHandler.END
 
 
 async def st_rem_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
